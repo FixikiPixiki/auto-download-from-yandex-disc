@@ -1,0 +1,287 @@
+(async function () {
+  'use strict';
+
+  // ============ НАСТРОЙКИ ============
+  const CONFIG = {
+    delayAfterSelect:   800,   // мс после успешного выделения
+    delayForDownload:   3500,  // мс после клика «Скачать» (ждём сервер)
+    delayBetweenItems:  500,   // мс между файлами
+    maxRetries:         3,     // попыток на файл
+    scrollStep:         600,   // шаг автопрокрутки, px
+    scrollDelay:        260,   // мс между шагами прокрутки
+    scrollStableRounds: 4,     // кругов без изменений → конец списка
+    DEBUG:              true,  // подробные логи (можно выключить)
+  };
+  // ===================================
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const log  = (...a) => console.log('%c[DL]', 'color:#0af;font-weight:bold', ...a);
+  const dbg  = (...a) => CONFIG.DEBUG && console.log('%c[DL]', 'color:#888', ...a);
+  const warn = (...a) => console.warn('%c[DL]', 'color:#fa0;font-weight:bold', ...a);
+  const err  = (...a) => console.error('%c[DL]', 'color:#f00;font-weight:bold', ...a);
+
+  const isVisible = el => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+
+  const waitFor = async (fn, timeout) => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) {
+      try { const v = fn(); if (v) return v; } catch {}
+      await sleep(100);
+    }
+    return null;
+  };
+
+  // ---------- НОРМАЛИЗАЦИЯ СТРОК ----------
+  // Приводим имена к единому виду: NFC, NBSP → пробел, zero-width → выкинуть,
+  // схлопываем подряд идущие пробелы.
+  const norm = s => (s || '')
+    .normalize('NFC')
+    .replace(/\u00A0/g, ' ')               // NBSP
+    .replace(/[\u200B-\u200D\uFEFF]/g, '') // zero-width, BOM
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Полное удаление пробелов — для сверхнадёжного fallback-сравнения
+  const squash = s => norm(s).replace(/\s+/g, '');
+
+  // Любой символ многоточия: Unicode … (U+2026), ⋯ (U+22EF), три точки
+  const ELLIPSIS_RE = /(\u2026|\u22EF|\.\.\.)/;
+
+  // ---------- СРАВНЕНИЕ ИМЁН С УЧЁТОМ ОБРЕЗКИ ----------
+  // shown   — видимый текст (может содержать «…»)
+  // full    — полное имя из title/aria-label (если есть)
+  // target  — имя из листинга (эталон)
+  const namesMatch = (shown, full, target) => {
+    const T  = norm(target);
+    const Ts = squash(target);
+
+    // 1) полное имя из атрибутов — прямое сравнение
+    if (full && (norm(full) === T || squash(full) === Ts)) return true;
+
+    // 2) показанный текст полностью совпал
+    if (shown && (norm(shown) === T || squash(shown) === Ts)) return true;
+
+    // 3) панель ещё не отрисовалась — не блокируем
+    if (!shown && !full) return true;
+
+    // 4) разбор обрезанного имени
+    const src = norm(shown);
+    const m = src.match(ELLIPSIS_RE);
+    if (m) {
+      const prefix = norm(src.slice(0, m.index));
+      const suffix = norm(src.slice(m.index + m[0].length));
+
+      // 4a) обычное сравнение с пробелами
+      if (T.startsWith(prefix) && T.endsWith(suffix)) return true;
+
+      // 4b) без пробелов вообще — лечит NBSP/разные типы пробелов
+      const pSq = squash(prefix);
+      const sSq = squash(suffix);
+      if (Ts.startsWith(pSq) && Ts.endsWith(sSq)) return true;
+
+      // 4c) диагностика — если оба сравнения не прошли
+      if (CONFIG.DEBUG) {
+        const tail = T.slice(-Math.max(suffix.length, 6) - 2);
+        dbg('  DIAG prefix =', JSON.stringify(prefix), 'suffix =', JSON.stringify(suffix));
+        dbg('  DIAG tail   =', JSON.stringify(tail));
+        dbg('  DIAG suffix codes =', [...suffix].map(c => c.codePointAt(0).toString(16)).join(' '));
+        dbg('  DIAG tail   codes =', [...tail  ].map(c => c.codePointAt(0).toString(16)).join(' '));
+      }
+      return false;
+    }
+
+    return false;
+  };
+
+  // ---------- ЭМУЛЯЦИЯ КЛИКА ----------
+  const simulateClick = (el) => {
+    el.scrollIntoView({ block: 'center' });
+    const r = el.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    const opts   = { bubbles: true, cancelable: true, composed: true, view: window,
+                     clientX: cx, clientY: cy, screenX: cx, screenY: cy,
+                     button: 0, buttons: 1, detail: 1 };
+    const upOpts = { ...opts, buttons: 0 };
+    try { el.dispatchEvent(new PointerEvent('pointerdown', { ...opts,   pointerId: 1, pointerType: 'mouse' })); } catch {}
+    el.dispatchEvent(new MouseEvent('mousedown', opts));
+    el.dispatchEvent(new MouseEvent('mouseup',   upOpts));
+    try { el.dispatchEvent(new PointerEvent('pointerup',   { ...upOpts, pointerId: 1, pointerType: 'mouse' })); } catch {}
+    el.dispatchEvent(new MouseEvent('click',     upOpts));
+  };
+
+  // ---------- ВЫДЕЛЕНИЕ ЭЛЕМЕНТА ----------
+  const selectItem = async (el) => {
+    el.scrollIntoView({ block: 'center' });
+    await sleep(200);
+    const isSelectedNow = () =>
+      el.getAttribute('aria-selected') === 'true' ||
+      !!document.querySelector('.resources-action-bar_visible');
+
+    // 1) нативный .click()
+    try { el.click(); } catch {}
+    if (await waitFor(isSelectedNow, 800)) return true;
+
+    // 2) полная эмуляция мыши
+    simulateClick(el);
+    if (await waitFor(isSelectedNow, 800)) return true;
+
+    // 3) клик по заголовку
+    const title = el.querySelector('.listing-item__title');
+    if (title) {
+      try { title.click(); } catch {}
+      if (await waitFor(isSelectedNow, 800)) return true;
+      simulateClick(title);
+      if (await waitFor(isSelectedNow, 800)) return true;
+    }
+
+    // 4) фокус + Enter
+    try {
+      el.focus();
+      el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      el.dispatchEvent(new KeyboardEvent('keyup',   { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+    } catch {}
+    return !!(await waitFor(isSelectedNow, 800));
+  };
+
+  // ========== ШАГ 1: АВТОПРОКРУТКА ==========
+  log('Шаг 1/3: прокрутка...');
+  let lastCount = 0, stable = 0;
+  while (stable < CONFIG.scrollStableRounds) {
+    window.scrollBy(0, CONFIG.scrollStep);
+    await sleep(CONFIG.scrollDelay);
+    const c = document.querySelectorAll('.listing-item[role="row"]').length;
+    const atBottom = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 4;
+    if (c === lastCount) stable++; else { stable = 0; lastCount = c; }
+    if (atBottom && c === lastCount) stable++;
+  }
+  window.scrollTo(0, 0);
+  await sleep(600);
+
+  // ========== ШАГ 2: СБОР СПИСКА ==========
+  log('Шаг 2/3: сбор списка файлов...');
+  const items = Array.from(document.querySelectorAll('.listing-item[role="row"]'))
+    .filter(el => el.classList.contains('listing-item_type_file'));   // только файлы
+
+  const files = items.map(el => {
+    const t = el.querySelector('.listing-item__title');
+    const name = t ? (t.getAttribute('aria-label') || t.textContent.trim()) : null;
+    return { el, name };
+  }).filter(f => f.name);
+
+  const totalFiles = files.length;
+  log(`Найдено файлов: ${totalFiles}`);
+  if (!totalFiles) return warn('Нечего скачивать.');
+
+  // ========== ШАГ 3: СКАЧИВАНИЕ ==========
+  log('Шаг 3/3: скачивание...');
+  const downloaded = new Set();
+  const failed = [];
+
+  for (let i = 0; i < files.length; i++) {
+    const { el, name } = files[i];
+    let ok = false;
+
+    for (let attempt = 1; attempt <= CONFIG.maxRetries && !ok; attempt++) {
+      try {
+        log(`[${i + 1}/${totalFiles}] "${name}" — попытка ${attempt}/${CONFIG.maxRetries}`);
+
+        // снять предыдущее выделение
+        const prevClose = document.querySelector('.resources-action-bar_visible .resources-action-bar__close');
+        if (prevClose) { prevClose.click(); await sleep(300); }
+
+        // выделить элемент
+        const selected = await selectItem(el);
+        if (!selected) { warn('  выделить не удалось — повтор'); await sleep(400); continue; }
+
+        // --- проверка имени в панели с учётом обрезки «…» и NBSP ---
+        const barNameEl = document.querySelector(
+          '.resources-action-bar_visible .resources-info-dropdown__name .clamped-text, ' +
+          '.resources-action-bar_visible .resources-info-dropdown__name'
+        );
+        const barFull = barNameEl
+          ? (barNameEl.getAttribute('title')
+             || barNameEl.getAttribute('aria-label')
+             || barNameEl.closest('[aria-label]')?.getAttribute('aria-label')
+             || null)
+          : null;
+        const barText = barNameEl ? barNameEl.textContent.trim() : null;
+
+        if (!namesMatch(barText, barFull, name)) {
+          warn(`  имя в панели "${barText}" ≠ "${name}" — повтор`);
+          continue;
+        }
+
+        // --- кнопка «Скачать» ---
+        let dlBtn = await waitFor(() => {
+          const list = document.querySelectorAll(
+            'button.groupable-buttons__visible-button_name_download, button[aria-label="Скачать"]'
+          );
+          for (const b of list) if (isVisible(b)) return b;
+          return null;
+        }, 3000);
+
+        // fallback — меню «Ещё»
+        if (!dlBtn) {
+          const moreBtn = document.querySelector('.groupable-buttons__more-button');
+          if (moreBtn && isVisible(moreBtn)) {
+            moreBtn.click();
+            await sleep(400);
+            const mi = await waitFor(() => document.querySelector(
+              'li[role="menuitem"][data-testid="download"], [role="menuitem"][aria-label="Скачать"]'
+            ), 1500);
+            if (mi) { mi.click(); ok = true; }
+            else    { document.body.click(); await sleep(200); }
+          }
+        } else {
+          dlBtn.click();
+          ok = true;
+        }
+
+        if (ok) {
+          downloaded.add(name);
+          log(`  ✓ запущено: ${name} (${downloaded.size}/${totalFiles})`);
+          await sleep(CONFIG.delayForDownload);
+        } else {
+          warn('  кнопка "Скачать" не найдена — повтор');
+          await sleep(500);
+        }
+
+        // снять выделение
+        const closeBtn = document.querySelector('.resources-action-bar_visible .resources-action-bar__close');
+        if (closeBtn && isVisible(closeBtn)) { closeBtn.click(); await sleep(250); }
+
+        await sleep(CONFIG.delayBetweenItems);
+
+      } catch (e) {
+        err('  ошибка:', e);
+        await sleep(500);
+      }
+    }
+
+    if (!ok) { failed.push(name); err(`✗ ${name}`); }
+  }
+
+  // ========== ИТОГОВЫЙ ОТЧЁТ ==========
+  console.log('%c\n========== ИТОГ ==========', 'color:#0af;font-size:14px;font-weight:bold');
+  console.log(`Всего файлов в листинге: ${totalFiles}`);
+  console.log(`Успешно отправлено: ${downloaded.size}`);
+  console.log(`Ошибок: ${failed.length}`);
+  if (failed.length) console.log('Не скачаны:', failed);
+
+  if (downloaded.size === totalFiles)
+    console.log('%c✓ Все файлы отправлены на скачивание', 'color:#0a0;font-weight:bold;font-size:13px');
+  else
+    console.log('%c⚠ Есть расхождения — см. failed выше', 'color:#f00;font-weight:bold;font-size:13px');
+
+  window.__dlResult = {
+    total: totalFiles,
+    downloaded: [...downloaded],
+    failed,
+  };
+  console.log('Результат доступен в window.__dlResult');
+})();

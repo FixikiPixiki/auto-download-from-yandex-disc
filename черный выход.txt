@@ -1,0 +1,173 @@
+(async function () {
+  'use strict';
+
+  // ============ НАСТРОЙКИ ============
+  const CONFIG = {
+    delayAfterSelect:   700,   // мс после клика по файлу (появления панели)
+    delayForDownload:   3500,  // мс после клика "Скачать" (даём серверу отдать файл)
+    delayBetweenItems:  400,   // мс между файлами
+    maxRetries:         3,     // попыток на один файл
+    scrollStep:         600,   // шаг автопрокрутки, px
+    scrollDelay:        260,   // мс между шагами прокрутки
+    scrollStableRounds: 4,     // сколько раз счётчик не менялся → конец
+  };
+  // ===================================
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const log  = (...a) => console.log('%c[YandexDL]', 'color:#0af;font-weight:bold', ...a);
+  const warn = (...a) => console.warn('%c[YandexDL]', 'color:#fa0;font-weight:bold', ...a);
+  const err  = (...a) => console.error('%c[YandexDL]', 'color:#f00;font-weight:bold', ...a);
+
+  const isVisible = el => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+
+  const fireClick = el => {
+    const r = el.getBoundingClientRect();
+    const opts = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0 };
+    el.dispatchEvent(new MouseEvent('mousedown', opts));
+    el.dispatchEvent(new MouseEvent('mouseup',   opts));
+    el.dispatchEvent(new MouseEvent('click',     opts));
+  };
+
+  // ========== 1. АВТОПРОКРУТКА ==========
+  log('Шаг 1/3: прокручиваю страницу, чтобы подгрузились все объекты...');
+  let lastCount = 0, stable = 0;
+  while (stable < CONFIG.scrollStableRounds) {
+    window.scrollBy(0, CONFIG.scrollStep);
+    await sleep(CONFIG.scrollDelay);
+    const c = document.querySelectorAll('.listing-item[role="row"]').length;
+    const atBottom = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 4;
+    if (c === lastCount) stable++; else { stable = 0; lastCount = c; }
+    if (atBottom && c === lastCount) stable++;
+  }
+  window.scrollTo(0, 0);
+  await sleep(500);
+
+  // ========== 2. СБОР СПИСКА ==========
+  log('Шаг 2/3: собираю список файлов...');
+  const items = Array.from(document.querySelectorAll('.listing-item[role="row"]'));
+  const files = items.map(el => {
+    const t = el.querySelector('.listing-item__title');
+    const name = t ? (t.getAttribute('aria-label') || t.textContent.trim()) : null;
+    return { el, name };
+  }).filter(f => f.name && f.name.toLowerCase().endsWith('.jpg') || f.name && f.name.toLowerCase().endsWith('.jpeg') || f.name && f.name.toLowerCase().endsWith('.png'));
+
+  const totalFiles = files.length;
+  log(`Найдено фотографий в листинге: ${totalFiles}`);
+
+  // ========== 3. СКАЧИВАНИЕ ==========
+  log('Шаг 3/3: начинаю скачивание...');
+  const downloaded = new Set();
+  const failed = [];
+
+  for (let i = 0; i < files.length; i++) {
+    const { el, name } = files[i];
+    let ok = false;
+
+    for (let attempt = 1; attempt <= CONFIG.maxRetries && !ok; attempt++) {
+      try {
+        log(`[${i + 1}/${totalFiles}] "${name}" — попытка ${attempt}/${CONFIG.maxRetries}`);
+
+        el.scrollIntoView({ block: 'center' });
+        await sleep(250);
+
+        // --- клик по элементу, чтобы он выделился ---
+        const clickTarget = el.querySelector('.listing-item__title') || el;
+        fireClick(clickTarget);
+        await sleep(CONFIG.delayAfterSelect);
+
+        // --- ПРОВЕРКА №1: элемент выделен? ---
+        if (el.getAttribute('aria-selected') !== 'true') {
+          warn(`  элемент не выделен — повтор`);
+          continue;
+        }
+
+        // --- ПРОВЕРКА №2: имя в панели действий совпадает с именем файла ---
+        const barNameEl = document.querySelector('.resources-info-dropdown__name .clamped-text');
+        const barName = barNameEl ? barNameEl.textContent.trim() : null;
+        if (barName && barName !== name) {
+          warn(`  имя в панели "${barName}" ≠ "${name}" — повтор`);
+          continue;
+        }
+
+        // --- кнопка "Скачать" в панели действий ---
+        let dlBtn = document.querySelector(
+          'button.groupable-buttons__visible-button_name_download[aria-label="Скачать"]'
+        );
+
+        // fallback — через меню "Ещё"
+        if (!dlBtn || !isVisible(dlBtn)) {
+          const moreBtn = document.querySelector('.groupable-buttons__more-button');
+          if (moreBtn && isVisible(moreBtn)) {
+            moreBtn.click();
+            await sleep(450);
+            const menuItem = document.querySelector(
+              'li[role="menuitem"][data-testid="download"], [role="menuitem"][aria-label="Скачать"]'
+            );
+            if (menuItem) {
+              menuItem.click();
+              ok = true;
+            } else {
+              document.body.click(); // закрыть меню
+              await sleep(200);
+            }
+          }
+        } else {
+          dlBtn.click();
+          ok = true;
+        }
+
+        if (ok) {
+          downloaded.add(name);
+          log(`  ✓ запущено скачивание: ${name} (${downloaded.size}/${totalFiles})`);
+          await sleep(CONFIG.delayForDownload);
+        } else {
+          warn(`  кнопка "Скачать" не найдена — повтор`);
+          await sleep(500);
+        }
+
+        // --- снять выделение, чтобы перейти к следующему ---
+        const closeBtn = document.querySelector('.resources-action-bar__close');
+        if (closeBtn && isVisible(closeBtn)) {
+          closeBtn.click();
+          await sleep(250);
+        }
+
+        await sleep(CONFIG.delayBetweenItems);
+
+      } catch (e) {
+        err(`  ошибка на "${name}":`, e);
+        await sleep(500);
+      }
+    }
+
+    if (!ok) {
+      failed.push(name);
+      err(`✗ не удалось скачать: ${name}`);
+    }
+  }
+
+  // ========== ИТОГОВЫЙ ОТЧЁТ ==========
+  console.log('%c\n========== ИТОГОВЫЙ ОТЧЁТ ==========', 'color:#0af;font-size:14px;font-weight:bold');
+  console.log(`Всего фотографий в листинге: ${totalFiles}`);
+  console.log(`Успешно отправлено на скачивание: ${downloaded.size}`);
+  console.log(`Не удалось: ${failed.length}`);
+  if (failed.length) console.log('Не скачаны:', failed);
+
+  if (downloaded.size === totalFiles) {
+    console.log('%c✓ Все фотографии отправлены на скачивание', 'color:#0a0;font-weight:bold;font-size:13px');
+  } else {
+    console.log('%c⚠ Есть расхождения — проверьте список failed выше', 'color:#f00;font-weight:bold;font-size:13px');
+  }
+
+  // Данные доступны в консоли
+  window.__yandexDLResult = {
+    total: totalFiles,
+    downloaded: [...downloaded],
+    failed,
+  };
+  console.log('Результат доступен в window.__yandexDLResult');
+})();
